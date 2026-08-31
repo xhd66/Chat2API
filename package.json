@@ -211,7 +211,7 @@
     },
     "publish": {
       "provider": "github",
-      "owner": "xiaoY233",
+      "owner": "xhd66",
       "repo": "Chat2API"
     }
   }
