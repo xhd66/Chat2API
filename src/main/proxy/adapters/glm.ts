@@ -14,9 +14,19 @@ import mime from 'mime-types'
 import path from 'path'
 import { toolsToSystemPrompt, TOOL_WRAP_HINT, hasToolPromptInjected } from '../utils/tools'
 import { parseToolCallsFromText } from '../utils/toolParser'
-import { 
+import {
   createBaseChunk,
 } from '../utils/streamToolHandler'
+import {
+  collectGlmSearchResults,
+  createGlmCitationRewriter,
+  createGlmPartState,
+  flushGlmCitations,
+  GlmPartStreamState,
+  processGlmCitations,
+  reconcileDelta,
+  rewriteGlmCitations,
+} from '../utils/glmStream'
 import { getProviderToolProfile } from '../toolCalling/providerProfiles'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
 import type { ToolCallingPlan } from '../toolCalling/types'
@@ -722,9 +732,10 @@ export class GLMStreamHandler {
 
   async handleStream(stream: any): Promise<PassThrough> {
     const transStream = new PassThrough()
-    const cachedParts: any[] = []
-    let sentContent = ''
-    let sentReasoning = ''
+    const partStates = new Map<string, GlmPartStreamState>()
+    const citation = createGlmCitationRewriter()
+    let lastTextPartId: string | null = null
+    let lastThinkPartId: string | null = null
     let sentRole = false
 
     transStream.write(
@@ -737,6 +748,104 @@ export class GLMStreamHandler {
       })}\n\n`
     )
 
+    const emitContent = (text: string, logicId: string) => {
+      if (!text) return
+      // 与旧版全量重组行为对齐:不同 part 的文本之间补一个换行分隔
+      const chunk = lastTextPartId !== null && lastTextPartId !== logicId ? '\n' + text : text
+      lastTextPartId = logicId
+
+      // Process tool call interception with shared parser buffering.
+      const baseChunk = createBaseChunk(this.conversationId, this.model, this.created)
+      const outputChunks = this.toolStreamParser?.push(chunk, baseChunk, !sentRole) ?? [
+        {
+          ...baseChunk,
+          choices: [{ index: 0, delta: { ...(!sentRole ? { role: 'assistant' } : {}), content: chunk }, finish_reason: null }],
+        },
+      ]
+
+      for (const outChunk of outputChunks) {
+        transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+      }
+
+      if (outputChunks.length > 0) sentRole = true
+    }
+
+    const emitReasoning = (text: string, logicId: string) => {
+      if (!text) return
+      const chunk = lastThinkPartId !== null && lastThinkPartId !== logicId ? '\n' + text : text
+      lastThinkPartId = logicId
+      transStream.write(
+        `data: ${JSON.stringify({
+          id: this.conversationId,
+          model: this.model,
+          object: 'chat.completion.chunk',
+          choices: [{ index: 0, delta: { reasoning_content: chunk }, finish_reason: null }],
+          created: this.created,
+        })}\n\n`
+      )
+    }
+
+    /**
+     * 处理一个 part 更新。增量事件(status=init)的 content 文本是纯增量;
+     * 收尾事件(part.status=finish)的 content 文本是全量快照,走对账补漏。
+     */
+    const processPart = (part: any) => {
+      if (!part || !Array.isArray(part.content)) return
+
+      const logicId = part.logic_id || part.id || 'default'
+      let state = partStates.get(logicId)
+      if (!state) {
+        state = createGlmPartState(logicId)
+        partStates.set(logicId, state)
+      }
+      if (part.status) state.status = part.status
+      const isSnapshot = part.status === 'finish'
+
+      part.content.forEach((value: any) => {
+        const { type, text, think, image, code, content: innerContent } = value
+
+        if (type === 'text') {
+          const { state: nextState, delta } = reconcileDelta(state.text, text || '', isSnapshot)
+          state.text = nextState
+          emitContent(processGlmCitations(delta, citation), logicId)
+        } else if (type === 'think') {
+          const { state: nextState, delta } = reconcileDelta(state.think, think || '', isSnapshot)
+          state.think = nextState
+          emitReasoning(delta, logicId)
+        } else if (type === 'code') {
+          const { state: nextState, delta } = reconcileDelta(state.code, code || '', isSnapshot)
+          if (delta) {
+            state.code = nextState
+            if (!state.codeFenceOpened) {
+              state.codeFenceOpened = true
+              emitContent('```python\n', logicId)
+            }
+            emitContent(delta, logicId)
+          }
+          if (isSnapshot && state.codeFenceOpened && !state.codeFenceClosed) {
+            state.codeFenceClosed = true
+            emitContent('\n```\n', logicId)
+          }
+        } else if (type === 'image' && Array.isArray(image)) {
+          state.images = image
+          if (isSnapshot && !state.imagesEmitted) {
+            state.imagesEmitted = true
+            const imageText =
+              image.reduce((imgs: string, v: any) => {
+                return imgs + (/^(http|https):\/\//.test(v.image_url) ? `![image](${v.image_url})` : '')
+              }, '') + '\n'
+            emitContent(imageText, logicId)
+          }
+        } else if (type === 'execution_output' && typeof innerContent === 'string') {
+          state.executionOutput = innerContent
+          if (isSnapshot && !state.executionEmitted) {
+            state.executionEmitted = true
+            emitContent(innerContent + '\n', logicId)
+          }
+        }
+      })
+    }
+
     const parser = createParser({
       onEvent: (event: any) => {
         try {
@@ -746,114 +855,22 @@ export class GLMStreamHandler {
             this.conversationId = result.conversation_id
           }
 
+          const parts = Array.isArray(result.parts) ? result.parts : []
+
           if (result.status !== 'finish' && result.status !== 'intervene') {
-            if (result.parts) {
-              result.parts.forEach((part: any) => {
-                const index = cachedParts.findIndex((p) => p.logic_id === part.logic_id)
-                if (index !== -1) {
-                  cachedParts[index] = part
-                } else {
-                  cachedParts.push(part)
-                }
-              })
-            }
-
-            const searchMap = new Map<string, any>()
-            cachedParts.forEach((part) => {
-              if (!part.content || !Array.isArray(part.content)) return
-              const { meta_data } = part
-              part.content.forEach((item: any) => {
-                if (item.type === 'tool_result' && meta_data?.tool_result_extra?.search_results) {
-                  meta_data.tool_result_extra.search_results.forEach((res: any) => {
-                    if (res.match_key) {
-                      searchMap.set(res.match_key, res)
-                    }
-                  })
-                }
-              })
-            })
-
-            const keyToIdMap = new Map<string, number>()
-            let counter = 1
-            let fullText = ''
-            let fullReasoning = ''
-
-            cachedParts.forEach((part) => {
-              const { content, meta_data } = part
-              if (!Array.isArray(content)) return
-
-              let partText = ''
-              let partReasoning = ''
-
-              content.forEach((value: any) => {
-                const { type, text, think, image, code, content: innerContent } = value
-
-                if (type === 'text') {
-                  let txt = text
-                  if (searchMap.size > 0) {
-                    txt = txt.replace(/【?(turn\d+[a-zA-Z]+\d+)】?/g, (match: string, key: string) => {
-                      const searchInfo = searchMap.get(key)
-                      if (!searchInfo) return match
-                      if (!keyToIdMap.has(key)) {
-                        keyToIdMap.set(key, counter++)
-                      }
-                      return ` [${keyToIdMap.get(key)}](${searchInfo.url})`
-                    })
-                  }
-                  partText += txt
-                } else if (type === 'think') {
-                  partReasoning += think
-                } else if (type === 'image' && Array.isArray(image) && part.status === 'finish') {
-                  const imageText =
-                    image.reduce((imgs: string, v: any) => {
-                      return imgs + (/^(http|https):\/\//.test(v.image_url) ? `![image](${v.image_url})` : '')
-                    }, '') + '\n'
-                  partText += imageText
-                } else if (type === 'code') {
-                  partText += '```python\n' + code + (part.status === 'finish' ? '\n```\n' : '')
-                } else if (type === 'execution_output' && typeof innerContent === 'string' && part.status === 'finish') {
-                  partText += innerContent + '\n'
-                }
-              })
-
-              if (partText) fullText += (fullText.length > 0 ? '\n' : '') + partText
-              if (partReasoning) fullReasoning += (fullReasoning.length > 0 ? '\n' : '') + partReasoning
-            })
-
-            const reasoningChunk = fullReasoning.substring(sentReasoning.length)
-            if (reasoningChunk) {
-              sentReasoning += reasoningChunk
-              transStream.write(
-                `data: ${JSON.stringify({
-                  id: this.conversationId,
-                  model: this.model,
-                  object: 'chat.completion.chunk',
-                  choices: [{ index: 0, delta: { reasoning_content: reasoningChunk }, finish_reason: null }],
-                  created: this.created,
-                })}\n\n`
-              )
-            }
-
-            const chunk = fullText.substring(sentContent.length)
-            if (chunk) {
-              sentContent += chunk
-            }
-            
-            // Process tool call interception with shared parser buffering.
-            const baseChunk = createBaseChunk(this.conversationId, this.model, this.created)
-            const outputChunks = this.toolStreamParser?.push(chunk, baseChunk, !sentRole) ?? (
-              chunk ? [{
-                ...baseChunk,
-                choices: [{ index: 0, delta: { ...(!sentRole ? { role: 'assistant' } : {}), content: chunk }, finish_reason: null }],
-              }] : []
-            )
-
-            for (const outChunk of outputChunks) {
-              transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
-            }
-
-            if (outputChunks.length > 0) sentRole = true
+            // 增量事件:先收集搜索结果,再逐 part 下发增量
+            parts.forEach((part: any) => collectGlmSearchResults(part, citation))
+            parts.forEach((part: any) => processPart(part))
           } else {
+            // 终止事件携带的 parts 是全量快照,同样走一遍对账,补齐增量流可能缺失的尾巴
+            // (intervene 为内容风控中断,保持旧行为:不处理其 parts,仅下发提示文本)
+            if (result.status === 'finish') {
+              parts.forEach((part: any) => collectGlmSearchResults(part, citation))
+              parts.forEach((part: any) => processPart(part))
+            }
+
+            emitContent(flushGlmCitations(citation), lastTextPartId || '')
+
             // Flush any remaining tool call buffer before finishing
             const baseChunk = createBaseChunk(this.conversationId, this.model, this.created)
             const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
@@ -898,6 +915,7 @@ export class GLMStreamHandler {
     // Handle stream errors - ensure proper cleanup
     stream.once('error', (err: Error) => {
       console.error('[GLM] Stream error:', err.message)
+      emitContent(flushGlmCitations(citation), lastTextPartId || '')
       // Flush any remaining tool call buffer
       const baseChunk = createBaseChunk(this.conversationId, this.model, this.created)
       const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
@@ -923,6 +941,7 @@ export class GLMStreamHandler {
       console.log('[GLM] Stream closed')
       // Only send finish if we haven't already
       if (!transStream.closed) {
+        emitContent(flushGlmCitations(citation), lastTextPartId || '')
         const baseChunk = createBaseChunk(this.conversationId, this.model, this.created)
         const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
         for (const outChunk of flushChunks) {
@@ -948,7 +967,93 @@ export class GLMStreamHandler {
 
   async handleNonStream(stream: any): Promise<any> {
     return new Promise((resolve, reject) => {
-      const cachedParts: any[] = []
+      const partStates = new Map<string, GlmPartStreamState>()
+      const citation = createGlmCitationRewriter()
+
+      // GLM sends incremental parts, each event only contains new content;
+      // 收尾事件(part.status=finish)携带全量快照,统一走 reconcileDelta 对账
+      const applyPart = (part: any) => {
+        if (!part || !Array.isArray(part.content)) return
+
+        const logicId = part.logic_id || part.id || 'default'
+        let state = partStates.get(logicId)
+        if (!state) {
+          state = createGlmPartState(logicId)
+          partStates.set(logicId, state)
+        }
+        if (part.status) state.status = part.status
+        collectGlmSearchResults(part, citation)
+        const isSnapshot = part.status === 'finish'
+
+        part.content.forEach((value: any) => {
+          const { type, text, think, image, code, content: innerContent } = value
+          if (type === 'text') {
+            state.text = reconcileDelta(state.text, text || '', isSnapshot).state
+          } else if (type === 'think') {
+            state.think = reconcileDelta(state.think, think || '', isSnapshot).state
+          } else if (type === 'code') {
+            state.code = reconcileDelta(state.code, code || '', isSnapshot).state
+          } else if (type === 'image' && Array.isArray(image)) {
+            state.images = image
+          } else if (type === 'execution_output' && typeof innerContent === 'string') {
+            state.executionOutput = innerContent
+          }
+        })
+      }
+
+      const buildResponse = () => {
+        let fullText = ''
+        let fullReasoning = ''
+
+        partStates.forEach((state) => {
+          let partText = ''
+          if (state.text) {
+            partText += state.text
+          }
+          if (state.code) {
+            partText += (partText ? '\n' : '') + '```python\n' + state.code + '\n```\n'
+          }
+          if (state.images && state.images.length > 0 && state.status === 'finish') {
+            partText +=
+              state.images.reduce((imgs: string, v: any) => {
+                return imgs + (/^(http|https):\/\//.test(v.image_url) ? `![image](${v.image_url})` : '')
+              }, '') + '\n'
+          }
+          if (typeof state.executionOutput === 'string' && state.status === 'finish') {
+            partText += state.executionOutput + '\n'
+          }
+
+          if (partText) fullText += (fullText.length > 0 ? '\n' : '') + partText
+          if (state.think) fullReasoning += (fullReasoning.length > 0 ? '\n' : '') + state.think
+        })
+
+        // 组装完成后对整段文本统一改写搜索引用(无跨块问题)
+        fullText = rewriteGlmCitations(fullText, citation)
+
+        const { content: cleanContent, toolCalls } = this.toolCallingPlan?.shouldParseResponse
+          ? { content: fullText, toolCalls: [] }
+          : parseToolCallsFromText(fullText, 'glm')
+
+        return {
+          id: this.conversationId,
+          model: this.model,
+          object: 'chat.completion',
+          choices: [
+            {
+              index: 0,
+              message: {
+                role: 'assistant',
+                content: toolCalls.length > 0 ? null : cleanContent.trim(),
+                reasoning_content: fullReasoning || null,
+                ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {})
+              },
+              finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
+            },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          created: Math.floor(Date.now() / 1000),
+        }
+      }
 
       const parser = createParser({
         onEvent: (event: any) => {
@@ -959,105 +1064,14 @@ export class GLMStreamHandler {
               this.conversationId = result.conversation_id
             }
 
-            if (result.status !== 'finish') {
-              if (result.parts) {
-                // Accumulate parts (same as handleStream), don't replace
-                // GLM sends incremental parts, each event only contains new content
-                result.parts.forEach((part: any) => {
-                  const index = cachedParts.findIndex((p) => p.logic_id === part.logic_id)
-                  if (index !== -1) {
-                    cachedParts[index] = part
-                  } else {
-                    cachedParts.push(part)
-                  }
-                })
-              }
-            } else {
-              const searchMap = new Map<string, any>()
-              cachedParts.forEach((part) => {
-                if (!part.content || !Array.isArray(part.content)) return
-                const { meta_data } = part
-                part.content.forEach((item: any) => {
-                  if (item.type === 'tool_result' && meta_data?.tool_result_extra?.search_results) {
-                    meta_data.tool_result_extra.search_results.forEach((res: any) => {
-                      if (res.match_key) {
-                        searchMap.set(res.match_key, res)
-                      }
-                    })
-                  }
-                })
-              })
+            const parts = Array.isArray(result.parts) ? result.parts : []
+            // intervene 为内容风控中断,保持旧行为:不累积其 parts
+            if (result.status !== 'intervene') {
+              parts.forEach(applyPart)
+            }
 
-              const keyToIdMap = new Map<string, number>()
-              let counter = 1
-              let fullText = ''
-              let fullReasoning = ''
-
-              cachedParts.forEach((part) => {
-                const { content, meta_data } = part
-                if (!Array.isArray(content)) return
-
-                let partText = ''
-                let partReasoning = ''
-
-                content.forEach((value: any) => {
-                  const { type, text, think, image, code, content: innerContent } = value
-
-                  if (type === 'text') {
-                    let txt = text
-                    if (searchMap.size > 0) {
-                      txt = txt.replace(/【?(turn\d+[a-zA-Z]+\d+)】?/g, (match: string, key: string) => {
-                        const searchInfo = searchMap.get(key)
-                        if (!searchInfo) return match
-                        if (!keyToIdMap.has(key)) {
-                          keyToIdMap.set(key, counter++)
-                        }
-                        return ` [${keyToIdMap.get(key)}](${searchInfo.url})`
-                      })
-                    }
-                    partText += txt
-                  } else if (type === 'think') {
-                    partReasoning += think
-                  } else if (type === 'image' && Array.isArray(image) && part.status === 'finish') {
-                    const imageText =
-                      image.reduce((imgs: string, v: any) => {
-                        return imgs + (/^(http|https):\/\//.test(v.image_url) ? `![image](${v.image_url})` : '')
-                      }, '') + '\n'
-                    partText += imageText
-                  } else if (type === 'code') {
-                    partText += '```python\n' + code + '\n```\n'
-                  } else if (type === 'execution_output' && typeof innerContent === 'string' && part.status === 'finish') {
-                    partText += innerContent + '\n'
-                  }
-                })
-
-                if (partText) fullText += (fullText.length > 0 ? '\n' : '') + partText
-                if (partReasoning) fullReasoning += (fullReasoning.length > 0 ? '\n' : '') + partReasoning
-              })
-
-              const { content: cleanContent, toolCalls } = this.toolCallingPlan?.shouldParseResponse
-                ? { content: fullText, toolCalls: [] }
-                : parseToolCallsFromText(fullText, 'glm')
-
-              resolve({
-                id: this.conversationId,
-                model: this.model,
-                object: 'chat.completion',
-                choices: [
-                  {
-                    index: 0,
-                    message: {
-                      role: 'assistant',
-                      content: toolCalls.length > 0 ? null : cleanContent.trim(),
-                      reasoning_content: fullReasoning || null,
-                      ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {})
-                    },
-                    finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
-                  },
-                ],
-                usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-                created: Math.floor(Date.now() / 1000),
-              })
+            if (result.status === 'finish') {
+              resolve(buildResponse())
             }
           } catch (err) {
             reject(err)
@@ -1065,7 +1079,8 @@ export class GLMStreamHandler {
         },
       })
 
-      stream.on('data', (buffer: Buffer) => parser.feed(buffer.toString()))
+      const decoder = new TextDecoder('utf-8')
+      stream.on('data', (buffer: Buffer) => parser.feed(decoder.decode(buffer, { stream: true })))
       stream.once('error', reject)
       stream.once('close', () => {
         resolve({
