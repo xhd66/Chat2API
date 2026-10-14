@@ -277,6 +277,33 @@ class StoreManager {
   }
 
   /**
+   * Drop user-added models colliding with default display names and un-exclude
+   * those defaults. Such state can only be legacy fallout from removeModel
+   * matching defaults by name first (custom models can no longer be added with
+   * a default's display name).
+   */
+  private healModelNameCollisions(
+    overrides: ProviderModelOverrides | undefined,
+    defaultModels: string[]
+  ): ProviderModelOverrides | undefined {
+    if (!overrides || defaultModels.length === 0) {
+      return overrides
+    }
+    const colliding = new Set(
+      overrides.addedModels
+        .filter(m => defaultModels.includes(m.displayName))
+        .map(m => m.displayName)
+    )
+    if (colliding.size === 0) {
+      return overrides
+    }
+    return {
+      addedModels: overrides.addedModels.filter(m => !colliding.has(m.displayName)),
+      excludedModels: overrides.excludedModels.filter(name => !colliding.has(name)),
+    }
+  }
+
+  /**
    * Initialize Default Providers
    * Clear provider list, users create providers by adding accounts
    */
@@ -306,6 +333,15 @@ class StoreManager {
               userModelOverrides[p.id] = sanitizedOverrides
               userModelOverridesChanged = true
             }
+          }
+
+          const healedOverrides = this.healModelNameCollisions(
+            userModelOverrides[p.id],
+            builtinConfig.supportedModels || []
+          )
+          if (healedOverrides && healedOverrides !== userModelOverrides[p.id]) {
+            userModelOverrides[p.id] = healedOverrides
+            userModelOverridesChanged = true
           }
 
           return { 
@@ -1581,6 +1617,15 @@ class StoreManager {
       }
     }
 
+    const provider = this.getProviderById(providerId)
+    if (!provider) {
+      throw new Error('Provider not found')
+    }
+
+    if ((provider.supportedModels || []).includes(model.displayName)) {
+      throw new Error(`Model with display name "${model.displayName}" already exists as a default model`)
+    }
+
     const existingModel = overrides[providerId].addedModels.find(
       m => m.displayName === model.displayName || m.actualModelId === model.actualModelId
     )
@@ -1618,16 +1663,18 @@ class StoreManager {
     }
 
     const defaultModels = provider.supportedModels || []
-    const isDefaultModel = defaultModels.includes(modelName)
+    const hasCustomModel = overrides[providerId].addedModels.some(
+      m => m.displayName === modelName
+    )
 
-    if (isDefaultModel) {
-      if (!overrides[providerId].excludedModels.includes(modelName)) {
-        overrides[providerId].excludedModels.push(modelName)
-      }
-    } else {
+    if (hasCustomModel) {
       overrides[providerId].addedModels = overrides[providerId].addedModels.filter(
         m => m.displayName !== modelName
       )
+    } else if (defaultModels.includes(modelName)) {
+      if (!overrides[providerId].excludedModels.includes(modelName)) {
+        overrides[providerId].excludedModels.push(modelName)
+      }
     }
 
     this.setUserModelOverrides(overrides)
